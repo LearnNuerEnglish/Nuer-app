@@ -1,8 +1,13 @@
-import React, { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import React, {
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  useLayoutEffect,
+} from "react";
 import {
   BookOpen,
   Search,
-  Settings2,
   ChevronLeft,
   ChevronRight,
   Menu,
@@ -10,6 +15,29 @@ import {
   Loader2,
   Home as HomeIcon,
 } from "lucide-react";
+
+/* ---------------------------------------------------------------------
+   Supabase connection — filled in automatically, no setup screen.
+--------------------------------------------------------------------- */
+const SUPABASE_URL = "https://tmuorrjahwzequjldism.supabase.co";
+const SUPABASE_ANON_KEY =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRtdW9ycmphaHd6ZXF1amxkaXNtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg5NjUxODMsImV4cCI6MjEwNDU0MTE4M30._ihRsxLv2xinM5p2jlA9Y0Nz586tbhq-dJ7-N6AHJ2k";
+
+const SB_HEADERS = {
+  apikey: SUPABASE_ANON_KEY,
+  Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+};
+
+async function sbGet(path, extraHeaders = {}) {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    headers: { ...SB_HEADERS, ...extraHeaders },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Request failed (${res.status}). ${body || res.statusText}`);
+  }
+  return res;
+}
 
 /* ---------------------------------------------------------------------
    Canonical book order — used to sort whatever distinct book names come
@@ -37,29 +65,45 @@ function orderBooks(list) {
   });
 }
 
+function keyOf(book, chapter) {
+  return `${book}::${chapter}`;
+}
+
+function groupByHeading(verses) {
+  const groups = [];
+  let current = null;
+  for (const v of verses) {
+    if (v.heading || !current) {
+      current = { heading: v.heading || null, items: [] };
+      groups.push(current);
+    }
+    current.items.push(v);
+  }
+  return groups;
+}
+
 /* ---------------------------------------------------------------------
    Component
 --------------------------------------------------------------------- */
 export default function BibleApp() {
-  const [config, setConfig] = useState({ url: "", key: "" });
-  const [draftConfig, setDraftConfig] = useState({ url: "", key: "" });
-  const [configured, setConfigured] = useState(false);
-  const [view, setView] = useState("settings"); // settings | home | reader | search
+  const [view, setView] = useState("home"); // home | reader | search
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const [books, setBooks] = useState([]);
-  const [booksLoading, setBooksLoading] = useState(false);
+  const [booksLoading, setBooksLoading] = useState(true);
   const [booksError, setBooksError] = useState(null);
+  const booksRef = useRef([]);
+  useEffect(() => {
+    booksRef.current = books;
+  }, [books]);
 
   const [expandedBook, setExpandedBook] = useState(null);
-  const [chapters, setChapters] = useState([]);
-  const [chaptersLoading, setChaptersLoading] = useState(false);
+  const [sidebarChapters, setSidebarChapters] = useState([]);
+  const [sidebarChaptersLoading, setSidebarChaptersLoading] = useState(false);
 
-  const [selectedBook, setSelectedBook] = useState(null);
-  const [selectedChapter, setSelectedChapter] = useState(null);
-  const [verses, setVerses] = useState([]);
-  const [versesLoading, setVersesLoading] = useState(false);
-  const [versesError, setVersesError] = useState(null);
+  const [dailyVerse, setDailyVerse] = useState(null);
+  const [dailyLoading, setDailyLoading] = useState(false);
+  const [dailyError, setDailyError] = useState(null);
 
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState([]);
@@ -67,36 +111,41 @@ export default function BibleApp() {
   const [searchError, setSearchError] = useState(null);
   const [hasSearched, setHasSearched] = useState(false);
 
-  const [dailyVerse, setDailyVerse] = useState(null);
-  const [dailyLoading, setDailyLoading] = useState(false);
-  const [dailyError, setDailyError] = useState(null);
+  /* ---- continuous reading engine ---- */
+  const [sequenceKeys, setSequenceKeys] = useState([]); // ordered "Book::chapter" list
+  const [chapterStore, setChapterStore] = useState({}); // key -> {book,chapter,verses,status,error}
+  const [activeKey, setActiveKey] = useState(null);
+  const [hasMoreNext, setHasMoreNext] = useState(true);
+  const [hasMorePrev, setHasMorePrev] = useState(true);
+
+  const chaptersByBookRef = useRef({});
+  const sequenceKeysRef = useRef([]);
+  useEffect(() => {
+    sequenceKeysRef.current = sequenceKeys;
+  }, [sequenceKeys]);
+  const chapterStoreRef = useRef({});
+  useEffect(() => {
+    chapterStoreRef.current = chapterStore;
+  }, [chapterStore]);
+  const loadingNextRef = useRef(false);
+  const loadingPrevRef = useRef(false);
+  const hasMoreNextRef = useRef(true);
+  const hasMorePrevRef = useRef(true);
+  useEffect(() => {
+    hasMoreNextRef.current = hasMoreNext;
+  }, [hasMoreNext]);
+  useEffect(() => {
+    hasMorePrevRef.current = hasMorePrev;
+  }, [hasMorePrev]);
 
   const scrollRef = useRef(null);
+  const topSentinelRef = useRef(null);
+  const bottomSentinelRef = useRef(null);
+  const pendingPrependRef = useRef(false);
 
-  const sbHeaders = useMemo(
-    () => ({ apikey: config.key, Authorization: `Bearer ${config.key}` }),
-    [config.key]
-  );
-
-  const sbGet = useCallback(
-    async (path, extraHeaders = {}) => {
-      const res = await fetch(`${config.url.replace(/\/$/, "")}/rest/v1/${path}`, {
-        headers: { ...sbHeaders, ...extraHeaders },
-      });
-      if (!res.ok) {
-        const body = await res.text().catch(() => "");
-        throw new Error(`Request failed (${res.status}). ${body || res.statusText}`);
-      }
-      return res;
-    },
-    [config.url, sbHeaders]
-  );
-
-  /* ---- load distinct books once configured ---- */
+  /* ---- load distinct books on mount ---- */
   useEffect(() => {
-    if (!configured) return;
     setBooksLoading(true);
-    setBooksError(null);
     sbGet("bible?select=book")
       .then((r) => r.json())
       .then((rows) => {
@@ -105,13 +154,11 @@ export default function BibleApp() {
       })
       .catch((err) => setBooksError(err.message))
       .finally(() => setBooksLoading(false));
-  }, [configured, sbGet]);
+  }, []);
 
   /* ---- daily verse: deterministic pick for today's date ---- */
   useEffect(() => {
-    if (!configured) return;
     setDailyLoading(true);
-    setDailyError(null);
     sbGet("bible?select=book&limit=1", { Prefer: "count=exact", Range: "0-0" })
       .then(async (r) => {
         const range = r.headers.get("content-range");
@@ -127,8 +174,25 @@ export default function BibleApp() {
       })
       .catch((err) => setDailyError(err.message))
       .finally(() => setDailyLoading(false));
-  }, [configured, sbGet]);
+  }, []);
 
+  const loadChaptersFor = useCallback(async (book) => {
+    if (chaptersByBookRef.current[book]) return chaptersByBookRef.current[book];
+    const r = await sbGet(`bible?book=eq.${encodeURIComponent(book)}&select=chapter`);
+    const rows = await r.json();
+    const unique = Array.from(new Set(rows.map((x) => x.chapter))).sort((a, b) => a - b);
+    chaptersByBookRef.current[book] = unique;
+    return unique;
+  }, []);
+
+  const loadVersesFor = useCallback(async (book, chapter) => {
+    const r = await sbGet(
+      `bible?book=eq.${encodeURIComponent(book)}&chapter=eq.${chapter}&select=*&order=verse.asc`
+    );
+    return r.json();
+  }, []);
+
+  /* sidebar book expand — reuses the shared chapter cache */
   const toggleBook = useCallback(
     (book) => {
       if (expandedBook === book) {
@@ -136,71 +200,218 @@ export default function BibleApp() {
         return;
       }
       setExpandedBook(book);
-      setChapters([]);
-      setChaptersLoading(true);
-      sbGet(`bible?book=eq.${encodeURIComponent(book)}&select=chapter`)
-        .then((r) => r.json())
-        .then((rows) => {
-          const unique = Array.from(new Set(rows.map((r) => r.chapter))).sort((a, b) => a - b);
-          setChapters(unique);
-        })
+      setSidebarChapters([]);
+      setSidebarChaptersLoading(true);
+      loadChaptersFor(book)
+        .then(setSidebarChapters)
         .catch((err) => setBooksError(err.message))
-        .finally(() => setChaptersLoading(false));
+        .finally(() => setSidebarChaptersLoading(false));
     },
-    [expandedBook, sbGet]
+    [expandedBook, loadChaptersFor]
   );
 
-  const openChapter = useCallback(
-    (book, chapter) => {
-      setSelectedBook(book);
-      setSelectedChapter(chapter);
+  /* jump to a specific book/chapter: reset the continuous sequence around it */
+  const jumpTo = useCallback(
+    async (book, chapter) => {
       setView("reader");
       setSidebarOpen(false);
-      setVersesLoading(true);
-      setVersesError(null);
-      sbGet(
-        `bible?book=eq.${encodeURIComponent(book)}&chapter=eq.${chapter}&select=*&order=verse.asc`
-      )
-        .then((r) => r.json())
-        .then(setVerses)
-        .catch((err) => setVersesError(err.message))
-        .finally(() => setVersesLoading(false));
+      const key = keyOf(book, chapter);
+      setChapterStore((s) => ({ ...s, [key]: { book, chapter, verses: null, status: "loading" } }));
+      setSequenceKeys([key]);
+      setActiveKey(key);
+      setHasMoreNext(true);
+      setHasMorePrev(true);
+
+      try {
+        await loadChaptersFor(book);
+        const verses = await loadVersesFor(book, chapter);
+        setChapterStore((s) => ({ ...s, [key]: { book, chapter, verses, status: "ready" } }));
+      } catch (err) {
+        setChapterStore((s) => ({
+          ...s,
+          [key]: { book, chapter, verses: [], status: "error", error: err.message },
+        }));
+      }
       if (scrollRef.current) scrollRef.current.scrollTop = 0;
     },
-    [sbGet]
+    [loadChaptersFor, loadVersesFor]
   );
 
-  const stepChapter = useCallback(
-    (delta) => {
-      const idx = chapters.indexOf(selectedChapter);
-      const nextIdx = idx + delta;
-      if (idx !== -1 && nextIdx >= 0 && nextIdx < chapters.length) {
-        openChapter(selectedBook, chapters[nextIdx]);
+  /* find the chapter after/before {book,chapter}, crossing book
+     boundaries as needed. Returns null at the edges of the collection. */
+  const computeNeighbor = useCallback(
+    async (book, chapter, direction) => {
+      let chList = chaptersByBookRef.current[book] || (await loadChaptersFor(book));
+      let idx = chList.indexOf(chapter);
+      if (direction === 1 && idx !== -1 && idx < chList.length - 1) {
+        return { book, chapter: chList[idx + 1] };
       }
+      if (direction === -1 && idx > 0) {
+        return { book, chapter: chList[idx - 1] };
+      }
+      const list = booksRef.current;
+      let bIdx = list.indexOf(book);
+      if (bIdx === -1) return null;
+      let guard = 0;
+      while (guard < list.length) {
+        bIdx += direction;
+        guard += 1;
+        if (bIdx < 0 || bIdx >= list.length) return null;
+        const candidate = list[bIdx];
+        const chs = await loadChaptersFor(candidate);
+        if (chs && chs.length > 0) {
+          return { book: candidate, chapter: direction === 1 ? chs[0] : chs[chs.length - 1] };
+        }
+      }
+      return null;
     },
-    [chapters, selectedChapter, selectedBook, openChapter]
+    [loadChaptersFor]
   );
 
-  const runSearch = useCallback(
-    (q) => {
-      if (!q.trim()) {
-        setSearchResults([]);
-        setHasSearched(false);
+  const appendNext = useCallback(async () => {
+    if (loadingNextRef.current || !hasMoreNextRef.current) return;
+    const keys = sequenceKeysRef.current;
+    if (keys.length === 0) return;
+    loadingNextRef.current = true;
+    const last = chapterStoreRef.current[keys[keys.length - 1]];
+    try {
+      const next = await computeNeighbor(last.book, last.chapter, 1);
+      if (!next) {
+        setHasMoreNext(false);
         return;
       }
-      setSearchLoading(true);
-      setSearchError(null);
-      setHasSearched(true);
-      sbGet(
-        `bible?text=ilike.*${encodeURIComponent(q.trim())}*&select=*&order=book.asc,chapter.asc,verse.asc&limit=40`
-      )
-        .then((r) => r.json())
-        .then(setSearchResults)
-        .catch((err) => setSearchError(err.message))
-        .finally(() => setSearchLoading(false));
-    },
-    [sbGet]
-  );
+      const key = keyOf(next.book, next.chapter);
+      setChapterStore((s) => ({
+        ...s,
+        [key]: { book: next.book, chapter: next.chapter, verses: null, status: "loading" },
+      }));
+      setSequenceKeys((s) => [...s, key]);
+      const verses = await loadVersesFor(next.book, next.chapter);
+      setChapterStore((s) => ({
+        ...s,
+        [key]: { book: next.book, chapter: next.chapter, verses, status: "ready" },
+      }));
+    } catch (err) {
+      setHasMoreNext(false);
+    } finally {
+      loadingNextRef.current = false;
+    }
+  }, [computeNeighbor, loadVersesFor]);
+
+  const prependPrev = useCallback(async () => {
+    if (loadingPrevRef.current || !hasMorePrevRef.current) return;
+    const keys = sequenceKeysRef.current;
+    if (keys.length === 0) return;
+    loadingPrevRef.current = true;
+    const first = chapterStoreRef.current[keys[0]];
+    try {
+      const prev = await computeNeighbor(first.book, first.chapter, -1);
+      if (!prev) {
+        setHasMorePrev(false);
+        return;
+      }
+      const key = keyOf(prev.book, prev.chapter);
+      const verses = await loadVersesFor(prev.book, prev.chapter);
+      setChapterStore((s) => ({
+        ...s,
+        [key]: { book: prev.book, chapter: prev.chapter, verses, status: "ready" },
+      }));
+      pendingPrependRef.current = true;
+      setSequenceKeys((s) => [key, ...s]);
+    } catch (err) {
+      setHasMorePrev(false);
+    } finally {
+      loadingPrevRef.current = false;
+    }
+  }, [computeNeighbor, loadVersesFor]);
+
+  /* preserve scroll position after prepending a chapter above */
+  useLayoutEffect(() => {
+    if (!pendingPrependRef.current) return;
+    pendingPrependRef.current = false;
+    const el = scrollRef.current;
+    if (!el) return;
+    const prevHeight = Number(el.dataset.prevHeight || 0);
+    const prevTop = Number(el.dataset.prevTop || 0);
+    const newHeight = el.scrollHeight;
+    el.scrollTop = prevTop + (newHeight - prevHeight);
+  }, [sequenceKeys]);
+
+  /* intersection observers driving the infinite scroll */
+  useEffect(() => {
+    if (view !== "reader") return;
+    const root = scrollRef.current;
+    if (!root) return;
+
+    const bottomObserver = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) appendNext();
+      },
+      { root, rootMargin: "600px 0px 600px 0px" }
+    );
+    const topObserver = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting) {
+          const el = scrollRef.current;
+          if (el) {
+            el.dataset.prevHeight = String(el.scrollHeight);
+            el.dataset.prevTop = String(el.scrollTop);
+          }
+          prependPrev();
+        }
+      },
+      { root, rootMargin: "600px 0px 600px 0px" }
+    );
+
+    if (bottomSentinelRef.current) bottomObserver.observe(bottomSentinelRef.current);
+    if (topSentinelRef.current) topObserver.observe(topSentinelRef.current);
+
+    return () => {
+      bottomObserver.disconnect();
+      topObserver.disconnect();
+    };
+  }, [view, sequenceKeys, appendNext, prependPrev]);
+
+  /* track which chapter is most visible, to label the header while reading */
+  useEffect(() => {
+    if (view !== "reader") return;
+    const root = scrollRef.current;
+    if (!root) return;
+    const sections = root.querySelectorAll("[data-chapter-key]");
+    if (sections.length === 0) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        let best = null;
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            if (!best || entry.intersectionRatio > best.intersectionRatio) best = entry;
+          }
+        }
+        if (best) setActiveKey(best.target.getAttribute("data-chapter-key"));
+      },
+      { root, threshold: [0.1, 0.3, 0.5, 0.7] }
+    );
+    sections.forEach((s) => observer.observe(s));
+    return () => observer.disconnect();
+  }, [view, sequenceKeys]);
+
+  const runSearch = useCallback((q) => {
+    if (!q.trim()) {
+      setSearchResults([]);
+      setHasSearched(false);
+      return;
+    }
+    setSearchLoading(true);
+    setSearchError(null);
+    setHasSearched(true);
+    sbGet(
+      `bible?text=ilike.*${encodeURIComponent(q.trim())}*&select=*&order=book.asc,chapter.asc,verse.asc&limit=40`
+    )
+      .then((r) => r.json())
+      .then(setSearchResults)
+      .catch((err) => setSearchError(err.message))
+      .finally(() => setSearchLoading(false));
+  }, []);
 
   useEffect(() => {
     if (view !== "search") return;
@@ -209,15 +420,7 @@ export default function BibleApp() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searchQuery, view]);
 
-  const handleConnect = (e) => {
-    e.preventDefault();
-    if (!draftConfig.url.trim() || !draftConfig.key.trim()) return;
-    setConfig({ url: draftConfig.url.trim(), key: draftConfig.key.trim() });
-    setConfigured(true);
-    setView("home");
-  };
-
-  /* ---------------------------------------------------------------- */
+  const activeEntry = activeKey ? chapterStore[activeKey] : null;
 
   return (
     <div className="bh-shell">
@@ -244,9 +447,7 @@ export default function BibleApp() {
           display: flex;
           flex-direction: column;
         }
-        .bh-display {
-          font-family: 'Fraunces', Georgia, serif;
-        }
+        .bh-display { font-family: 'Fraunces', Georgia, serif; }
         .bh-scrollbar::-webkit-scrollbar { width: 8px; }
         .bh-scrollbar::-webkit-scrollbar-thumb { background: var(--ink-line); border-radius: 4px; }
         .bh-scrollbar::-webkit-scrollbar-track { background: transparent; }
@@ -267,180 +468,74 @@ export default function BibleApp() {
         }
       `}</style>
 
-      {view === "settings" && (
-        <SettingsScreen
-          draftConfig={draftConfig}
-          setDraftConfig={setDraftConfig}
-          onSubmit={handleConnect}
-          canSkip={configured}
-          onCancel={() => setView("home")}
+      <Header
+        onMenu={() => setSidebarOpen((s) => !s)}
+        onHome={() => setView("home")}
+        onSearch={() => setView("search")}
+        active={view}
+        readingTitle={
+          view === "reader" && activeEntry ? `${activeEntry.book} ${activeEntry.chapter}` : null
+        }
+      />
+
+      <div className="flex flex-1 min-h-0 relative">
+        <Sidebar
+          open={sidebarOpen}
+          books={books}
+          booksLoading={booksLoading}
+          booksError={booksError}
+          expandedBook={expandedBook}
+          chapters={sidebarChapters}
+          chaptersLoading={sidebarChaptersLoading}
+          selectedBook={activeEntry?.book}
+          selectedChapter={activeEntry?.chapter}
+          onToggleBook={toggleBook}
+          onSelectChapter={jumpTo}
+          onClose={() => setSidebarOpen(false)}
         />
-      )}
 
-      {view !== "settings" && (
-        <>
-          <Header
-            onMenu={() => setSidebarOpen((s) => !s)}
-            onHome={() => setView("home")}
-            onSearch={() => setView("search")}
-            onSettings={() => {
-              setDraftConfig(config);
-              setView("settings");
-            }}
-            active={view}
-          />
-
-          <div className="flex flex-1 min-h-0 relative">
-            <Sidebar
-              open={sidebarOpen}
-              books={books}
-              booksLoading={booksLoading}
-              booksError={booksError}
-              expandedBook={expandedBook}
-              chapters={chapters}
-              chaptersLoading={chaptersLoading}
-              selectedBook={selectedBook}
-              selectedChapter={selectedChapter}
-              onToggleBook={toggleBook}
-              onSelectChapter={openChapter}
-              onClose={() => setSidebarOpen(false)}
+        <main
+          ref={scrollRef}
+          className="flex-1 min-w-0 overflow-y-auto bh-scrollbar"
+          style={{ background: "var(--parchment)" }}
+        >
+          {view === "home" && (
+            <HomeView
+              dailyVerse={dailyVerse}
+              dailyLoading={dailyLoading}
+              dailyError={dailyError}
+              onBrowse={() => setSidebarOpen(true)}
+              onSearch={() => setView("search")}
+              onOpenDaily={() => {
+                if (dailyVerse) jumpTo(dailyVerse.book, dailyVerse.chapter);
+              }}
             />
-
-            <main
-              ref={scrollRef}
-              className="flex-1 min-w-0 overflow-y-auto bh-scrollbar"
-              style={{ background: "var(--parchment)" }}
-            >
-              {view === "home" && (
-                <HomeView
-                  dailyVerse={dailyVerse}
-                  dailyLoading={dailyLoading}
-                  dailyError={dailyError}
-                  onBrowse={() => setSidebarOpen(true)}
-                  onSearch={() => setView("search")}
-                  onOpenDaily={() => {
-                    if (dailyVerse) openChapter(dailyVerse.book, dailyVerse.chapter);
-                  }}
-                />
-              )}
-
-              {view === "reader" && (
-                <ReaderView
-                  book={selectedBook}
-                  chapter={selectedChapter}
-                  verses={verses}
-                  loading={versesLoading}
-                  error={versesError}
-                  onPrev={() => stepChapter(-1)}
-                  onNext={() => stepChapter(1)}
-                  canPrev={chapters.indexOf(selectedChapter) > 0}
-                  canNext={
-                    chapters.indexOf(selectedChapter) !== -1 &&
-                    chapters.indexOf(selectedChapter) < chapters.length - 1
-                  }
-                />
-              )}
-
-              {view === "search" && (
-                <SearchView
-                  query={searchQuery}
-                  setQuery={setSearchQuery}
-                  results={searchResults}
-                  loading={searchLoading}
-                  error={searchError}
-                  hasSearched={hasSearched}
-                  onOpenResult={(row) => openChapter(row.book, row.chapter)}
-                />
-              )}
-            </main>
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
-
-/* ---------------------------------------------------------------------
-   Settings
---------------------------------------------------------------------- */
-function SettingsScreen({ draftConfig, setDraftConfig, onSubmit, canSkip, onCancel }) {
-  return (
-    <div
-      className="flex-1 flex items-center justify-center p-6"
-      style={{ background: "var(--ink)" }}
-    >
-      <form
-        onSubmit={onSubmit}
-        className="w-full max-w-md rounded-sm p-8"
-        style={{ background: "var(--ink-panel)", border: "1px solid var(--ink-line)" }}
-      >
-        <h1 className="bh-display text-2xl mb-1" style={{ color: "var(--parchment)" }}>
-          Connect your Bible table
-        </h1>
-        <p className="text-sm mb-6" style={{ color: "var(--ash-dim)" }}>
-          Enter your Supabase project URL and anon key. They're kept only in this session
-          and are never saved.
-        </p>
-
-        <label className="block text-sm mb-1" style={{ color: "var(--ash)" }}>
-          Project URL
-        </label>
-        <input
-          type="text"
-          required
-          placeholder="https://your-project.supabase.co"
-          value={draftConfig.url}
-          onChange={(e) => setDraftConfig((c) => ({ ...c, url: e.target.value }))}
-          className="bh-focusable w-full mb-4 px-3 py-2 rounded-sm text-sm"
-          style={{
-            background: "var(--ink)",
-            border: "1px solid var(--ink-line)",
-            color: "var(--parchment)",
-          }}
-        />
-
-        <label className="block text-sm mb-1" style={{ color: "var(--ash)" }}>
-          Anon (public) key
-        </label>
-        <input
-          type="password"
-          required
-          placeholder="eyJhbGciOi..."
-          value={draftConfig.key}
-          onChange={(e) => setDraftConfig((c) => ({ ...c, key: e.target.value }))}
-          className="bh-focusable w-full mb-6 px-3 py-2 rounded-sm text-sm"
-          style={{
-            background: "var(--ink)",
-            border: "1px solid var(--ink-line)",
-            color: "var(--parchment)",
-          }}
-        />
-
-        <div className="flex items-center gap-3">
-          <button
-            type="submit"
-            className="bh-focusable px-4 py-2 rounded-sm text-sm bh-display"
-            style={{ background: "var(--oxide)", color: "var(--parchment)" }}
-          >
-            Connect
-          </button>
-          {canSkip && (
-            <button
-              type="button"
-              onClick={onCancel}
-              className="bh-focusable text-sm"
-              style={{ color: "var(--ash-dim)" }}
-            >
-              Cancel
-            </button>
           )}
-        </div>
 
-        <p className="text-xs mt-6" style={{ color: "var(--ash-dim)" }}>
-          Table expected: <code>bible</code> with columns book, chapter, verse, heading,
-          text, reference. Row Level Security must allow read access for the anon key.
-        </p>
-      </form>
+          {view === "reader" && (
+            <ScrollReader
+              sequenceKeys={sequenceKeys}
+              chapterStore={chapterStore}
+              topSentinelRef={topSentinelRef}
+              bottomSentinelRef={bottomSentinelRef}
+              hasMorePrev={hasMorePrev}
+              hasMoreNext={hasMoreNext}
+            />
+          )}
+
+          {view === "search" && (
+            <SearchView
+              query={searchQuery}
+              setQuery={setSearchQuery}
+              results={searchResults}
+              loading={searchLoading}
+              error={searchError}
+              hasSearched={hasSearched}
+              onOpenResult={(row) => jumpTo(row.book, row.chapter)}
+            />
+          )}
+        </main>
+      </div>
     </div>
   );
 }
@@ -448,7 +543,7 @@ function SettingsScreen({ draftConfig, setDraftConfig, onSubmit, canSkip, onCanc
 /* ---------------------------------------------------------------------
    Header
 --------------------------------------------------------------------- */
-function Header({ onMenu, onHome, onSearch, onSettings, active }) {
+function Header({ onMenu, onHome, onSearch, active, readingTitle }) {
   return (
     <header
       className="flex items-center justify-between px-4 py-3 shrink-0"
@@ -466,14 +561,13 @@ function Header({ onMenu, onHome, onSearch, onSettings, active }) {
         <button onClick={onHome} className="bh-focusable flex items-center gap-2">
           <BookOpen size={18} style={{ color: "var(--brass)" }} />
           <span className="bh-display text-lg" style={{ color: "var(--parchment)" }}>
-            Scripture
+            {readingTitle || "Scripture"}
           </span>
         </button>
       </div>
       <nav className="flex items-center gap-1">
         <HeaderIcon icon={HomeIcon} label="Home" onClick={onHome} activeState={active === "home"} />
         <HeaderIcon icon={Search} label="Search" onClick={onSearch} activeState={active === "search"} />
-        <HeaderIcon icon={Settings2} label="Settings" onClick={onSettings} activeState={false} />
       </nav>
     </header>
   );
@@ -512,11 +606,7 @@ function Sidebar({
   return (
     <>
       {open && (
-        <div
-          className="fixed inset-0 bg-black/40 z-10 md:hidden"
-          onClick={onClose}
-          aria-hidden="true"
-        />
+        <div className="fixed inset-0 bg-black/40 z-10 md:hidden" onClick={onClose} aria-hidden="true" />
       )}
       <aside
         className={`bh-scrollbar overflow-y-auto shrink-0 w-72 z-20 transition-transform duration-200 md:translate-x-0 md:static fixed top-0 left-0 h-full md:h-auto ${
@@ -545,14 +635,10 @@ function Sidebar({
               <button
                 onClick={() => onToggleBook(book)}
                 className="bh-focusable w-full text-left px-4 py-2 text-sm flex items-center justify-between"
-                style={{
-                  color: book === selectedBook ? "var(--brass)" : "var(--ash)",
-                }}
+                style={{ color: book === selectedBook ? "var(--brass)" : "var(--ash)" }}
               >
                 <span>{book}</span>
-                <span style={{ color: "var(--ash-dim)" }}>
-                  {expandedBook === book ? "–" : "+"}
-                </span>
+                <span style={{ color: "var(--ash-dim)" }}>{expandedBook === book ? "–" : "+"}</span>
               </button>
               {expandedBook === book && (
                 <div className="px-4 pb-3">
@@ -621,8 +707,7 @@ function HomeView({ dailyVerse, dailyLoading, dailyError, onBrowse, onSearch, on
 
       {dailyError && (
         <p className="text-sm" style={{ color: "var(--oxide)" }}>
-          Couldn't load today's verse — {dailyError} Check your connection settings and
-          that the table allows public reads.
+          Couldn't load today's verse — {dailyError}
         </p>
       )}
 
@@ -630,17 +715,11 @@ function HomeView({ dailyVerse, dailyLoading, dailyError, onBrowse, onSearch, on
         <button onClick={onOpenDaily} className="bh-focusable text-left block group">
           <div style={{ borderTop: "2px solid var(--oxide)", paddingTop: "1rem" }}>
             {dailyVerse.heading && (
-              <p
-                className="bh-display text-base mb-2"
-                style={{ color: "var(--oxide)" }}
-              >
+              <p className="bh-display text-base mb-2" style={{ color: "var(--oxide)" }}>
                 {dailyVerse.heading}
               </p>
             )}
-            <p
-              className="text-2xl leading-relaxed mb-3"
-              style={{ color: "var(--ink-text)" }}
-            >
+            <p className="text-2xl leading-relaxed mb-3" style={{ color: "var(--ink-text)" }}>
               {dailyVerse.text}
             </p>
             <p className="text-sm" style={{ color: "var(--ink-text-dim)" }}>
@@ -668,17 +747,18 @@ function HomeView({ dailyVerse, dailyLoading, dailyError, onBrowse, onSearch, on
       </div>
 
       <p className="hidden md:block text-sm mt-6" style={{ color: "var(--ink-text-dim)" }}>
-        Pick a book from the left to start reading.
+        Pick a book from the left to start reading — scrolling down moves into the next
+        chapter automatically, just like turning a page.
       </p>
     </div>
   );
 }
 
 /* ---------------------------------------------------------------------
-   Reader
+   Continuous scroll reader
 --------------------------------------------------------------------- */
-function ReaderView({ book, chapter, verses, loading, error, onPrev, onNext, canPrev, canNext }) {
-  if (!book) {
+function ScrollReader({ sequenceKeys, chapterStore, topSentinelRef, bottomSentinelRef, hasMorePrev, hasMoreNext }) {
+  if (sequenceKeys.length === 0) {
     return (
       <div className="max-w-2xl mx-auto px-6 py-16">
         <p style={{ color: "var(--ink-text-dim)" }}>
@@ -689,111 +769,89 @@ function ReaderView({ book, chapter, verses, loading, error, onPrev, onNext, can
   }
 
   return (
-    <div className="max-w-2xl mx-auto px-6 py-12">
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="bh-display text-3xl" style={{ color: "var(--ink-text)" }}>
-          {book} {chapter}
-        </h1>
-        <div className="flex gap-1">
-          <button
-            onClick={onPrev}
-            disabled={!canPrev}
-            className="bh-focusable p-2 rounded-sm disabled:opacity-30"
-            style={{ color: "var(--ink-text)" }}
-            aria-label="Previous chapter"
-          >
-            <ChevronLeft size={18} />
-          </button>
-          <button
-            onClick={onNext}
-            disabled={!canNext}
-            className="bh-focusable p-2 rounded-sm disabled:opacity-30"
-            style={{ color: "var(--ink-text)" }}
-            aria-label="Next chapter"
-          >
-            <ChevronRight size={18} />
-          </button>
-        </div>
-      </div>
-
-      {loading && (
-        <p className="text-sm flex items-center gap-2" style={{ color: "var(--ink-text-dim)" }}>
-          <Loader2 size={14} className="animate-spin" /> Loading chapter…
+    <div className="max-w-2xl mx-auto px-6 py-10">
+      <div ref={topSentinelRef} style={{ height: 1 }} />
+      {hasMorePrev && (
+        <p
+          className="text-xs text-center py-3 flex items-center justify-center gap-2"
+          style={{ color: "var(--ink-text-dim)" }}
+        >
+          <Loader2 size={12} className="animate-spin" /> Loading previous chapter…
         </p>
       )}
 
-      {error && (
+      {sequenceKeys.map((key) => {
+        const entry = chapterStore[key];
+        if (!entry) return null;
+        return <ChapterBlock key={key} entryKey={key} entry={entry} />;
+      })}
+
+      {hasMoreNext ? (
+        <p
+          className="text-xs text-center py-6 flex items-center justify-center gap-2"
+          style={{ color: "var(--ink-text-dim)" }}
+        >
+          <Loader2 size={12} className="animate-spin" /> Loading next chapter…
+        </p>
+      ) : (
+        <p className="text-xs text-center py-6" style={{ color: "var(--ink-text-dim)" }}>
+          End of scripture.
+        </p>
+      )}
+      <div ref={bottomSentinelRef} style={{ height: 1 }} />
+    </div>
+  );
+}
+
+function ChapterBlock({ entryKey, entry }) {
+  const { book, chapter, status, verses, error } = entry;
+  return (
+    <section data-chapter-key={entryKey} className="mb-14 bh-verse-enter">
+      <h2 className="bh-display text-2xl mb-6" style={{ color: "var(--ink-text)" }}>
+        {book} {chapter}
+      </h2>
+
+      {status === "loading" && (
+        <p className="text-sm flex items-center gap-2" style={{ color: "var(--ink-text-dim)" }}>
+          <Loader2 size={14} className="animate-spin" /> Loading…
+        </p>
+      )}
+
+      {status === "error" && (
         <p className="text-sm" style={{ color: "var(--oxide)" }}>
           Couldn't load this chapter — {error}
         </p>
       )}
 
-      {!loading && !error && verses.length === 0 && (
+      {status === "ready" && verses.length === 0 && (
         <p className="text-sm" style={{ color: "var(--ink-text-dim)" }}>
           No verses found for this chapter.
         </p>
       )}
 
-      {!loading && verses.length > 0 && (
-        <div key={`${book}-${chapter}`} className="bh-verse-enter">
-          {groupByHeading(verses).map((group, i) => (
-            <div key={i} className="mb-6">
-              {group.heading && (
-                <p className="bh-display text-lg mb-2" style={{ color: "var(--oxide)" }}>
-                  {group.heading}
-                </p>
-              )}
-              <p className="text-lg leading-loose" style={{ color: "var(--ink-text)" }}>
-                {group.items.map((v) => (
-                  <span key={v.verse}>
-                    <sup
-                      className="mr-1 select-none"
-                      style={{ color: "var(--brass)", fontSize: "0.7em" }}
-                    >
-                      {v.verse}
-                    </sup>
-                    {v.text}{" "}
-                  </span>
-                ))}
+      {status === "ready" &&
+        verses.length > 0 &&
+        groupByHeading(verses).map((group, i) => (
+          <div key={i} className="mb-6">
+            {group.heading && (
+              <p className="bh-display text-lg mb-2" style={{ color: "var(--oxide)" }}>
+                {group.heading}
               </p>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div className="flex justify-between mt-10 pt-6" style={{ borderTop: "1px solid var(--parchment-line)" }}>
-        <button
-          onClick={onPrev}
-          disabled={!canPrev}
-          className="bh-focusable text-sm disabled:opacity-30 flex items-center gap-1"
-          style={{ color: "var(--ink-text)" }}
-        >
-          <ChevronLeft size={14} /> Previous chapter
-        </button>
-        <button
-          onClick={onNext}
-          disabled={!canNext}
-          className="bh-focusable text-sm disabled:opacity-30 flex items-center gap-1"
-          style={{ color: "var(--ink-text)" }}
-        >
-          Next chapter <ChevronRight size={14} />
-        </button>
-      </div>
-    </div>
+            )}
+            <p className="text-lg leading-loose" style={{ color: "var(--ink-text)" }}>
+              {group.items.map((v) => (
+                <span key={v.verse}>
+                  <sup className="mr-1 select-none" style={{ color: "var(--brass)", fontSize: "0.7em" }}>
+                    {v.verse}
+                  </sup>
+                  {v.text}{" "}
+                </span>
+              ))}
+            </p>
+          </div>
+        ))}
+    </section>
   );
-}
-
-function groupByHeading(verses) {
-  const groups = [];
-  let current = null;
-  for (const v of verses) {
-    if (v.heading || !current) {
-      current = { heading: v.heading || null, items: [] };
-      groups.push(current);
-    }
-    current.items.push(v);
-  }
-  return groups;
 }
 
 /* ---------------------------------------------------------------------
@@ -815,11 +873,7 @@ function SearchView({ query, setQuery, results, loading, error, hasSearched, onO
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search for a word or phrase…"
           className="bh-focusable w-full pl-9 pr-3 py-2.5 text-sm rounded-sm"
-          style={{
-            background: "transparent",
-            border: "1px solid var(--parchment-line)",
-            color: "var(--ink-text)",
-          }}
+          style={{ background: "transparent", border: "1px solid var(--parchment-line)", color: "var(--ink-text)" }}
         />
       </div>
 
@@ -847,9 +901,7 @@ function SearchView({ query, setQuery, results, loading, error, hasSearched, onO
             <button
               onClick={() => onOpenResult(row)}
               className="bh-focusable text-left block w-full py-4"
-              style={{
-                borderTop: i === 0 ? "none" : "1px solid var(--parchment-line)",
-              }}
+              style={{ borderTop: i === 0 ? "none" : "1px solid var(--parchment-line)" }}
             >
               <p className="text-sm mb-1 bh-display" style={{ color: "var(--brass)" }}>
                 {row.reference || `${row.book} ${row.chapter}:${row.verse}`}
